@@ -73,6 +73,10 @@ struct Args {
     /// gRPC storage backend host URI
     #[arg(long, default_value = "http://127.0.0.1:4317")]
     host: http::Uri,
+    
+    /// Listen address for the HTTP server
+    #[arg(long, default_value = "0.0.0.0:3000")]
+    listen: String,
 }
 
 /// Main application entry point.
@@ -122,9 +126,9 @@ async fn main() {
         .with_state(state);
 
     // Start HTTP server
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    let listener = tokio::net::TcpListener::bind(&args.listen).await.unwrap();
 
-    log::info!("Listening on 0.0.0.0:3000");
+    log::info!("Listening on {}", args.listen);
     // Serve requests indefinitely
     axum::serve(listener, app).await.unwrap();
 }
