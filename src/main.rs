@@ -7,7 +7,7 @@
 //! ## Architecture
 //!
 //! The application consists of:
-//! - Static file serving for the Jaeger UI frontend
+//! - Embedded static file serving for the Jaeger UI frontend
 //! - HTTP API endpoints that proxy requests to a gRPC storage backend
 //! - Protocol buffer definitions for communication with the storage service
 //!
@@ -29,9 +29,9 @@
 use axum::{Router, routing::get};
 use clap::Parser;
 use simple_logger::SimpleLogger;
-use tower_http::services::{ServeDir, ServeFile};
 
 mod handlers;
+mod static_files;
 
 /// Protocol buffer definitions for communicating with the Jaeger storage backend.
 ///
@@ -78,11 +78,11 @@ struct Args {
 /// Main application entry point.
 ///
 /// This function sets up the HTTP server, configures routing, and starts serving
-/// both the Jaeger UI static files and the API endpoints.
+/// both the embedded Jaeger UI static files and the API endpoints.
 ///
 /// # Server Configuration
 /// - Binds to `0.0.0.0:3000` to accept connections from any interface
-/// - Serves static files from `./actual/` directory (Jaeger UI)
+/// - Serves embedded static files for Jaeger UI (compiled into binary)
 /// - Configures API routes under `/api/` prefix
 /// - Establishes gRPC connection to storage backend
 ///
@@ -116,11 +116,8 @@ async fn main() {
         .route("/api/traces/{trace_id}", get(handlers::get_trace))
         .route("/api/dependencies", get(handlers::get_dependencies))
         .route("/api/archive/{trace_id}", get(handlers::get_archived_trace))
-        // Static file serving for Jaeger UI
-        .fallback_service(
-            ServeDir::new("./actual/").not_found_service(ServeFile::new("./actual/index.html")),
-        )
-        // .fallback_service(ServeFile::new("./actual/index.html"))
+        // Static file serving for Jaeger UI (embedded)
+        .fallback_service(static_files::static_file_service())
         // Attach application state (gRPC client)
         .with_state(state);
 
