@@ -73,6 +73,20 @@ pub struct ApiError {
     msg: String,
 }
 
+/// Represents a span reference in Jaeger format.
+#[derive(Serialize, Clone)]
+pub struct JaegerReference {
+    /// Reference type ("CHILD_OF" or "FOLLOWS_FROM")
+    #[serde(rename = "refType")]
+    ref_type: String,
+    /// Trace ID of the referenced span
+    #[serde(rename = "traceID")]
+    trace_id: String,
+    /// Span ID of the referenced span
+    #[serde(rename = "spanID")]
+    span_id: String,
+}
+
 /// Represents a span in Jaeger UI format.
 ///
 /// This struct converts OpenTelemetry span data into the format expected
@@ -88,9 +102,13 @@ pub struct JaegerSpan {
     /// Hex-encoded parent span ID (8 bytes), null if root span
     #[serde(rename = "parentSpanID")]
     parent_span_id: Option<String>,
+    /// Flags field (usually 1 for sampled traces)
+    flags: u32,
     /// Human-readable operation name
     #[serde(rename = "operationName")]
     operation_name: String,
+    /// References to other spans (modern way to define relationships)
+    references: Vec<JaegerReference>,
     /// Start time in microseconds since Unix epoch
     #[serde(rename = "startTime")]
     start_time: u64,
@@ -98,6 +116,8 @@ pub struct JaegerSpan {
     duration: u64,
     /// List of key-value tags/attributes on the span
     tags: Vec<JaegerTag>,
+    /// List of log entries (not currently used)
+    logs: Vec<serde_json::Value>,
     /// Process ID referencing the processes map in the trace
     #[serde(rename = "processID")]
     process_id: String,
@@ -188,6 +208,16 @@ fn convert_span(
         tags: vec![],
     };
 
+    // Create references array for parent-child relationship
+    let mut references = Vec::new();
+    if !span.parent_span_id.is_empty() {
+        references.push(JaegerReference {
+            ref_type: "CHILD_OF".to_string(),
+            trace_id: hex::encode(&span.trace_id),
+            span_id: hex::encode(&span.parent_span_id),
+        });
+    }
+
     let jaeger_span = JaegerSpan {
         trace_id: hex::encode(&span.trace_id),
         span_id: hex::encode(&span.span_id),
@@ -196,7 +226,9 @@ fn convert_span(
         } else {
             Some(hex::encode(&span.parent_span_id))
         },
+        flags: 1, // Typically 1 for sampled traces
         operation_name: span.name.clone(),
+        references,
         start_time: span.start_time_unix_nano / 1_000,
         duration: span
             .end_time_unix_nano
@@ -214,6 +246,7 @@ fn convert_span(
                     .unwrap_or_default(),
             })
             .collect(),
+        logs: Vec::new(), // No logs for now
         process_id: process_id.clone(),
     };
 
