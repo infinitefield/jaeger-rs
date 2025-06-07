@@ -71,25 +71,30 @@ cargo build --release
 
 ### Configuration
 
-Currently the gRPC backend URL is hardcoded in `src/main.rs`:
+The gRPC backend URL can be configured via command line:
 
-```rust
-let state = handlers::AppState::new("http://ty2-trac01:4317".parse().unwrap()).await;
+```bash
+# Default: connects to localhost:4317
+cargo run
+
+# Custom backend
+cargo run -- --host http://your-jaeger-backend:4317
 ```
-
-Update this line to point to your Jaeger storage backend.
 
 ### Running
 
 ```bash
-# Run with default logging
+# Run with default backend (localhost:4317)
 cargo run
+
+# Run with custom backend
+cargo run -- --host http://your-backend:4317
 
 # Run with debug logging
 RUST_LOG=debug cargo run
 
-# Run with trace-level logging
-RUST_LOG=trace cargo run
+# Combined: custom backend with debug logging
+RUST_LOG=debug cargo run -- --host http://your-backend:4317
 ```
 
 The server will start on `http://0.0.0.0:3000`.
@@ -207,6 +212,9 @@ RUST_LOG=debug cargo run
 curl http://localhost:3000/api/services
 curl "http://localhost:3000/api/operations?service=my-service"
 curl "http://localhost:3000/api/traces?service=my-service&limit=10"
+
+# View help for command line options
+cargo run -- --help
 ```
 
 ## Performance
@@ -222,8 +230,7 @@ The application is designed for high performance:
 
 1. **Tags filtering** - Not yet implemented in trace search
 2. **Dependencies endpoint** - Returns "not implemented" response
-3. **Configuration** - gRPC URL is currently hardcoded
-4. **Authentication** - No built-in authentication/authorization
+3. **Authentication** - No built-in authentication/authorization
 
 ## Contributing
 

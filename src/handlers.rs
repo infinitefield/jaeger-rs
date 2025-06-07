@@ -30,14 +30,18 @@ pub struct AppState {
 impl AppState {
     /// Creates a new AppState with a gRPC connection to the specified URI.
     ///
+    /// Uses lazy connection establishment and enables gzip compression for efficiency.
+    ///
     /// # Arguments
-    /// * `uri` - The URI of the Jaeger storage gRPC service
+    /// * `uri` - The URI of the Jaeger storage gRPC service (e.g., "http://localhost:4317")
     ///
     /// # Returns
-    /// A new AppState instance with an established gRPC connection
+    /// A new AppState instance with a lazy gRPC connection
     ///
-    /// # Panics
-    /// Panics if the gRPC connection cannot be established
+    /// # Examples
+    /// ```
+    /// let state = AppState::new("http://localhost:4317".parse().unwrap());
+    /// ```
     pub fn new(uri: http::Uri) -> Self {
         let channel = Channel::builder(uri.clone()).connect_lazy();
         let client = TraceReaderClient::new(channel)
@@ -108,6 +112,8 @@ pub struct JaegerSpan {
     #[serde(rename = "operationName")]
     operation_name: String,
     /// References to other spans (modern way to define relationships)
+    ///
+    /// https://github.com/jaegertracing/jaeger/blob/2f80e4e681e90a8488e84fcdb1a6e2455c48372c/internal/uimodel/converter/v1/json/from_domain.go#L90
     references: Vec<JaegerReference>,
     /// Start time in microseconds since Unix epoch
     #[serde(rename = "startTime")]
@@ -171,12 +177,239 @@ impl<T> ApiResponse<T> {
             errors: None,
         }
     }
+
+    /// Creates an error response from a gRPC error.
+    ///
+    /// # Arguments
+    /// * `error` - The gRPC error
+    /// * `context` - Additional context for logging
+    fn from_grpc_error(error: tonic::Status, context: &str) -> Self
+    where
+        T: Default,
+    {
+        log::error!("{}: gRPC error: {}", context, error);
+        Self {
+            data: T::default(),
+            total: 0,
+            limit: 0,
+            offset: 0,
+            errors: Some(vec![ApiError {
+                code: 500,
+                msg: format!("gRPC error: {}", error),
+            }]),
+        }
+    }
+
+    /// Creates a not found error response.
+    ///
+    /// # Arguments
+    /// * `message` - The error message
+    fn not_found(message: String) -> Self
+    where
+        T: Default,
+    {
+        Self {
+            data: T::default(),
+            total: 0,
+            limit: 0,
+            offset: 0,
+            errors: Some(vec![ApiError {
+                code: 404,
+                msg: message,
+            }]),
+        }
+    }
+
+    /// Creates a not implemented error response.
+    ///
+    /// # Arguments
+    /// * `message` - The error message
+    fn not_implemented(message: String) -> Self
+    where
+        T: Default,
+    {
+        Self {
+            data: T::default(),
+            total: 0,
+            limit: 0,
+            offset: 0,
+            errors: Some(vec![ApiError {
+                code: 501,
+                msg: message,
+            }]),
+        }
+    }
+
+    /// Creates an error response with the given error.
+    ///
+    /// # Arguments
+    /// * `error` - The API error
+    fn errored(error: ApiError) -> Self
+    where
+        T: Default,
+    {
+        Self {
+            data: T::default(),
+            total: 0,
+            limit: 0,
+            offset: 0,
+            errors: Some(vec![error]),
+        }
+    }
+}
+
+/// Extracts service name from resource attributes.
+///
+/// # Arguments
+/// * `resource` - The OpenTelemetry resource
+///
+/// # Returns
+/// Service name or "unknown-service" if not found
+fn extract_service_name(
+    resource: Option<&opentelemetry_proto::tonic::resource::v1::Resource>,
+) -> String {
+    resource
+        .and_then(|resource| {
+            resource.attributes.iter().find(|attr| attr.key == "service.name")
+        })
+        .and_then(|attr| attr.value.as_ref())
+        .and_then(|value| {
+            if let Some(opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(s)) = &value.value {
+                Some(s.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "unknown-service".to_string())
+}
+
+/// Parses a trace ID from a hex string.
+///
+/// # Arguments
+/// * `trace_id` - Hex-encoded trace ID
+///
+/// # Returns
+/// Decoded bytes or UTF-8 bytes if hex parsing fails
+fn parse_trace_id(trace_id: &str) -> Vec<u8> {
+    hex::decode(trace_id).unwrap_or_else(|_| {
+        log::warn!(
+            "Failed to decode hex trace_id '{}', using as UTF-8 bytes",
+            trace_id
+        );
+        trace_id.as_bytes().to_vec()
+    })
+}
+
+/// Parses a timestamp from microseconds to protobuf Timestamp.
+///
+/// # Arguments
+/// * `microseconds` - Timestamp in microseconds since Unix epoch
+///
+/// # Returns
+/// Protobuf Timestamp
+fn parse_timestamp(microseconds: i64) -> crate::rpc::google::protobuf::Timestamp {
+    crate::rpc::google::protobuf::Timestamp {
+        seconds: microseconds / 1_000_000,
+        nanos: ((microseconds % 1_000_000) * 1000) as i32,
+    }
+}
+
+/// Parses a duration from microseconds to protobuf Duration.
+///
+/// # Arguments
+/// * `microseconds` - Duration in microseconds
+///
+/// # Returns
+/// Protobuf Duration
+fn parse_duration(microseconds: u64) -> crate::rpc::google::protobuf::Duration {
+    crate::rpc::google::protobuf::Duration {
+        seconds: (microseconds / 1_000_000) as i64,
+        nanos: ((microseconds % 1_000_000) * 1000) as i32,
+    }
+}
+
+/// Processes OpenTelemetry spans into Jaeger format.
+///
+/// # Arguments
+/// * `resource_spans` - Iterator of resource spans from gRPC response
+///
+/// # Returns
+/// Vector of (span, service_name) tuples
+fn process_resource_spans<I>(
+    resource_spans: I,
+) -> Vec<(opentelemetry_proto::tonic::trace::v1::Span, String)>
+where
+    I: IntoIterator<Item = opentelemetry_proto::tonic::trace::v1::ResourceSpans>,
+{
+    let mut spans = Vec::new();
+    
+    for resource_span in resource_spans {
+        let service_name = extract_service_name(resource_span.resource.as_ref());
+        
+        for scope_span in resource_span.scope_spans {
+            for span in scope_span.spans {
+                spans.push((span, service_name.clone()));
+            }
+        }
+    }
+    
+    spans
+}
+
+/// Converts processed spans to Jaeger traces.
+///
+/// # Arguments
+/// * `spans` - Vector of (span, service_name) tuples
+///
+/// # Returns
+/// Vector of JaegerTrace objects
+fn convert_to_jaeger_traces(
+    spans: Vec<(opentelemetry_proto::tonic::trace::v1::Span, String)>,
+) -> Vec<JaegerTrace> {
+    let mut all_jaeger_spans = Vec::new();
+    let mut all_processes = std::collections::HashMap::new();
+
+    for (span, service_name) in &spans {
+        let (jaeger_span, process_id, jaeger_process) =
+            convert_span(span, service_name.clone());
+        all_jaeger_spans.push(jaeger_span);
+        all_processes.insert(process_id, jaeger_process);
+    }
+
+    log::debug!(
+        "Converted {} spans to Jaeger format with {} unique processes",
+        all_jaeger_spans.len(),
+        all_processes.len()
+    );
+
+    // Group spans by trace ID to create proper trace objects
+    let mut trace_map: std::collections::HashMap<String, Vec<JaegerSpan>> =
+        std::collections::HashMap::new();
+    for span in all_jaeger_spans {
+        trace_map
+            .entry(span.trace_id.clone())
+            .or_default()
+            .push(span);
+    }
+
+    trace_map
+        .into_iter()
+        .map(|(trace_id, spans)| JaegerTrace {
+            trace_id,
+            spans,
+            processes: all_processes.clone(),
+        })
+        .collect()
 }
 
 /// Converts an OpenTelemetry span to Jaeger UI format.
 ///
 /// This function transforms span data from the OpenTelemetry protobuf format
-/// into the JSON structure expected by the Jaeger UI frontend.
+/// into the JSON structure expected by the Jaeger UI frontend. It handles:
+/// - Converting nanosecond timestamps to microseconds
+/// - Creating parent-child references 
+/// - Transforming attributes to tags
+/// - Generating process IDs based on service names
 ///
 /// # Arguments
 /// * `span` - OpenTelemetry span from the storage backend
@@ -298,18 +531,7 @@ pub async fn get_services(State(state): State<AppState>) -> Json<ApiResponse<Vec
             Json(response)
         }
         Err(e) => {
-            log::error!("get_services: gRPC error: {}", e);
-
-            let response = ApiResponse {
-                data: vec![],
-                total: 0,
-                limit: 0,
-                offset: 0,
-                errors: Some(vec![ApiError {
-                    code: 500,
-                    msg: format!("gRPC error: {}", e),
-                }]),
-            };
+            let response = ApiResponse::from_grpc_error(e, "get_services");
             log::debug!(
                 "get_services: Output - Error response: {:?}",
                 response.errors
@@ -383,22 +605,10 @@ pub async fn get_operations(
             Json(response)
         }
         Err(e) => {
-            log::error!(
-                "get_operations: gRPC error for service '{}': {}",
-                params.service,
-                e
+            let response = ApiResponse::from_grpc_error(
+                e,
+                &format!("get_operations for service '{}'", params.service),
             );
-
-            let response = ApiResponse {
-                data: vec![],
-                total: 0,
-                limit: 0,
-                offset: 0,
-                errors: Some(vec![ApiError {
-                    code: 500,
-                    msg: format!("gRPC error: {}", e),
-                }]),
-            };
             log::debug!(
                 "get_operations: Output - Error response: {:?}",
                 response.errors
@@ -480,22 +690,10 @@ pub async fn get_service_operations(
             Json(response)
         }
         Err(e) => {
-            log::error!(
-                "get_service_operations: gRPC error for service '{}': {}",
-                service,
-                e
+            let response = ApiResponse::from_grpc_error(
+                e,
+                &format!("get_service_operations for service '{}'", service),
             );
-
-            let response = ApiResponse {
-                data: vec![],
-                total: 0,
-                limit: 0,
-                offset: 0,
-                errors: Some(vec![ApiError {
-                    code: 500,
-                    msg: format!("gRPC error: {}", e),
-                }]),
-            };
             log::debug!(
                 "get_service_operations: Output - Error response: {:?}",
                 response.errors
@@ -509,17 +707,25 @@ pub async fn get_service_operations(
 #[serde_as]
 #[derive(Deserialize, Debug)]
 pub struct TracesQuery {
+    /// Service name to filter traces by
     service: Option<String>,
+    /// Operation name to filter traces by
     operation: Option<String>,
+    /// Tag-based filters (not yet implemented)
     tags: Option<String>,
+    /// Start time filter (microseconds since Unix epoch)
     start: Option<String>,
+    /// End time filter (microseconds since Unix epoch)
     end: Option<String>,
+    /// Minimum duration filter (microseconds)
     #[serde_as(as = "NoneAsEmptyString")]
     #[serde(rename = "minDuration")]
     min_duration: Option<String>,
+    /// Maximum duration filter (microseconds)
     #[serde_as(as = "NoneAsEmptyString")]
     #[serde(rename = "maxDuration")]
     max_duration: Option<String>,
+    /// Maximum number of traces to return (default: 1000)
     limit: Option<u32>,
 }
 
@@ -549,17 +755,14 @@ pub async fn get_traces(
 
     let mut client = state.client.clone();
 
-    // Parse timestamps
+    // Parse timestamps and durations
     let start_time = params
         .start
         .as_ref()
         .and_then(|s| s.parse::<i64>().ok())
         .map(|ts| {
             log::debug!("get_traces: Parsed start time: {} microseconds", ts);
-            crate::rpc::google::protobuf::Timestamp {
-                seconds: ts / 1_000_000,
-                nanos: ((ts % 1_000_000) * 1000) as i32,
-            }
+            parse_timestamp(ts)
         });
 
     let end_time = params
@@ -568,10 +771,7 @@ pub async fn get_traces(
         .and_then(|s| s.parse::<i64>().ok())
         .map(|ts| {
             log::debug!("get_traces: Parsed end time: {} microseconds", ts);
-            crate::rpc::google::protobuf::Timestamp {
-                seconds: ts / 1_000_000,
-                nanos: ((ts % 1_000_000) * 1000) as i32,
-            }
+            parse_timestamp(ts)
         });
 
     let duration_min = params
@@ -580,10 +780,7 @@ pub async fn get_traces(
         .and_then(|d| d.parse().ok())
         .map(|d: u64| {
             log::debug!("get_traces: Parsed min duration: {} microseconds", d);
-            crate::rpc::google::protobuf::Duration {
-                seconds: (d / 1_000_000) as i64,
-                nanos: ((d % 1_000_000) * 1000) as i32,
-            }
+            parse_duration(d)
         });
 
     let duration_max = params
@@ -592,10 +789,7 @@ pub async fn get_traces(
         .and_then(|d| d.parse().ok())
         .map(|d: u64| {
             log::debug!("get_traces: Parsed max duration: {} microseconds", d);
-            crate::rpc::google::protobuf::Duration {
-                seconds: (d / 1_000_000) as i64,
-                nanos: ((d % 1_000_000) * 1000) as i32,
-            }
+            parse_duration(d)
         });
 
     let limit = params.limit.unwrap_or(1000);
@@ -619,78 +813,21 @@ pub async fn get_traces(
         Ok(response) => {
             log::debug!("get_traces: Received gRPC response, processing stream");
             let mut stream = response.into_inner();
-            let mut traces = vec![];
+            let mut all_resource_spans = Vec::new();
 
             while let Ok(Some(chunk)) = stream.message().await {
                 log::trace!(
                     "get_traces: Processing chunk with {} resource spans",
                     chunk.resource_spans.len()
                 );
-
-                for resource_span in chunk.resource_spans {
-                    // Extract service name from resource attributes
-                    let service_name = resource_span
-                        .resource
-                        .as_ref()
-                        .and_then(|resource| {
-                            resource.attributes.iter().find(|attr| attr.key == "service.name")
-                        })
-                        .and_then(|attr| attr.value.as_ref())
-                        .and_then(|value| {
-                            if let Some(opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(s)) = &value.value {
-                                Some(s.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_else(|| "unknown-service".to_string());
-
-                    for scope_span in resource_span.scope_spans {
-                        for span in scope_span.spans {
-                            traces.push((span, service_name.clone()));
-                        }
-                    }
-                }
+                all_resource_spans.extend(chunk.resource_spans);
             }
+
+            let traces = process_resource_spans(all_resource_spans);
 
             log::info!("get_traces: Success - Found {} spans", traces.len());
 
-            // Convert spans and collect processes
-            let mut all_jaeger_spans = Vec::new();
-            let mut all_processes = std::collections::HashMap::new();
-
-            for (span, service_name) in &traces {
-                let (jaeger_span, process_id, jaeger_process) =
-                    convert_span(span, service_name.clone());
-                all_jaeger_spans.push(jaeger_span);
-                all_processes.insert(process_id, jaeger_process);
-            }
-
-            log::debug!(
-                "get_traces: Converted {} spans to Jaeger format with {} unique processes",
-                all_jaeger_spans.len(),
-                all_processes.len()
-            );
-
-            // Group spans by trace ID to create proper trace objects
-            let mut trace_map: std::collections::HashMap<String, Vec<JaegerSpan>> =
-                std::collections::HashMap::new();
-            for span in all_jaeger_spans {
-                trace_map
-                    .entry(span.trace_id.clone())
-                    .or_default()
-                    .push(span);
-            }
-
-            let jaeger_traces: Vec<JaegerTrace> = trace_map
-                .into_iter()
-                .map(|(trace_id, spans)| JaegerTrace {
-                    trace_id,
-                    spans,
-                    processes: all_processes.clone(),
-                })
-                .collect();
-
+            let jaeger_traces = convert_to_jaeger_traces(traces);
             log::debug!(
                 "get_traces: Grouped spans into {} traces",
                 jaeger_traces.len()
@@ -701,18 +838,7 @@ pub async fn get_traces(
             Json(response)
         }
         Err(e) => {
-            log::error!("get_traces: gRPC error: {}", e);
-
-            let response = ApiResponse {
-                data: vec![],
-                total: 0,
-                limit: 0,
-                offset: 0,
-                errors: Some(vec![ApiError {
-                    code: 500,
-                    msg: format!("gRPC error: {}", e),
-                }]),
-            };
+            let response = ApiResponse::from_grpc_error(e, "get_traces");
             log::debug!("get_traces: Output - Error response: {:?}", response.errors);
             Json(response)
         }
@@ -738,14 +864,7 @@ pub async fn get_trace(
 
     let mut client = state.client.clone();
 
-    // Parse trace_id as bytes
-    let trace_id_bytes = hex::decode(&trace_id).unwrap_or_else(|_| {
-        log::warn!(
-            "get_trace: Failed to decode hex trace_id '{}', using as UTF-8 bytes",
-            trace_id
-        );
-        trace_id.clone().into_bytes()
-    });
+    let trace_id_bytes = parse_trace_id(&trace_id);
     log::debug!(
         "get_trace: Parsed trace_id to {} bytes",
         trace_id_bytes.len()
@@ -764,38 +883,17 @@ pub async fn get_trace(
         Ok(response) => {
             log::debug!("get_trace: Received gRPC response, processing stream");
             let mut stream = response.into_inner();
-            let mut spans = Vec::new();
+            let mut all_resource_spans = Vec::new();
 
             while let Ok(Some(chunk)) = stream.message().await {
                 log::trace!(
                     "get_trace: Processing chunk with {} resource spans",
                     chunk.resource_spans.len()
                 );
-                for resource_span in chunk.resource_spans {
-                    // Extract service name from resource attributes
-                    let service_name = resource_span
-                        .resource
-                        .as_ref()
-                        .and_then(|resource| {
-                            resource.attributes.iter().find(|attr| attr.key == "service.name")
-                        })
-                        .and_then(|attr| attr.value.as_ref())
-                        .and_then(|value| {
-                            if let Some(opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(s)) = &value.value {
-                                Some(s.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_else(|| "unknown-service".to_string());
-
-                    for scope_span in resource_span.scope_spans {
-                        for span in scope_span.spans {
-                            spans.push((span, service_name.clone()));
-                        }
-                    }
-                }
+                all_resource_spans.extend(chunk.resource_spans);
             }
+
+            let spans = process_resource_spans(all_resource_spans);
 
             log::info!(
                 "get_trace: Success - Found {} spans for trace '{}'",
@@ -803,21 +901,17 @@ pub async fn get_trace(
                 trace_id
             );
 
-            // Convert spans and collect processes
-            let mut jaeger_spans = Vec::new();
-            let mut processes = std::collections::HashMap::new();
-
-            for (span, service_name) in &spans {
-                let (jaeger_span, process_id, jaeger_process) =
-                    convert_span(span, service_name.clone());
-                jaeger_spans.push(jaeger_span);
-                processes.insert(process_id, jaeger_process);
-            }
-
-            let trace = JaegerTrace {
-                trace_id: trace_id.clone(),
-                spans: jaeger_spans,
-                processes,
+            let jaeger_traces = convert_to_jaeger_traces(spans);
+            let trace = if let Some(mut trace) = jaeger_traces.into_iter().next() {
+                // Use the original trace_id from the request to maintain consistency
+                trace.trace_id = trace_id.clone();
+                trace
+            } else {
+                JaegerTrace {
+                    trace_id: trace_id.clone(),
+                    spans: Vec::new(),
+                    processes: std::collections::HashMap::new(),
+                }
             };
             log::debug!(
                 "get_trace: Created trace object with {} spans",
@@ -828,18 +922,10 @@ pub async fn get_trace(
             Json(response)
         }
         Err(e) => {
-            log::error!("get_trace: gRPC error for trace '{}': {}", trace_id, e);
-
-            let response = ApiResponse {
-                data: vec![],
-                total: 0,
-                limit: 0,
-                offset: 0,
-                errors: Some(vec![ApiError {
-                    code: 500,
-                    msg: format!("gRPC error: {}", e),
-                }]),
-            };
+            let response = ApiResponse::from_grpc_error(
+                e,
+                &format!("get_trace for trace_id '{}'", trace_id),
+            );
             log::debug!("get_trace: Output - Error response: {:?}", response.errors);
             Json(response)
         }
@@ -863,16 +949,7 @@ pub async fn get_dependencies(
         "get_dependencies: Dependencies API not implemented - returning not implemented response"
     );
 
-    let response = ApiResponse {
-        data: vec![],
-        total: 0,
-        limit: 0,
-        offset: 0,
-        errors: Some(vec![ApiError {
-            code: 501,
-            msg: "Dependencies API not implemented".to_string(),
-        }]),
-    };
+    let response = ApiResponse::not_implemented("Dependencies API not implemented".to_string());
     log::debug!(
         "get_dependencies: Output - Error response: {:?}",
         response.errors
@@ -900,13 +977,7 @@ pub async fn get_archived_trace(
 
     let mut client = state.client.clone();
 
-    let trace_id_bytes = hex::decode(&trace_id).unwrap_or_else(|_| {
-        log::warn!(
-            "get_archived_trace: Failed to decode hex trace_id '{}', using as UTF-8 bytes",
-            trace_id
-        );
-        trace_id.clone().into_bytes()
-    });
+    let trace_id_bytes = parse_trace_id(&trace_id);
     log::debug!(
         "get_archived_trace: Parsed trace_id to {} bytes",
         trace_id_bytes.len()
@@ -925,38 +996,17 @@ pub async fn get_archived_trace(
         Ok(response) => {
             log::debug!("get_archived_trace: Received gRPC response, processing stream");
             let mut stream = response.into_inner();
-            let mut spans = Vec::new();
+            let mut all_resource_spans = Vec::new();
 
             while let Ok(Some(chunk)) = stream.message().await {
                 log::trace!(
                     "get_archived_trace: Processing chunk with {} resource spans",
                     chunk.resource_spans.len()
                 );
-                for resource_span in chunk.resource_spans {
-                    // Extract service name from resource attributes
-                    let service_name = resource_span
-                        .resource
-                        .as_ref()
-                        .and_then(|resource| {
-                            resource.attributes.iter().find(|attr| attr.key == "service.name")
-                        })
-                        .and_then(|attr| attr.value.as_ref())
-                        .and_then(|value| {
-                            if let Some(opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(s)) = &value.value {
-                                Some(s.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_else(|| "unknown-service".to_string());
-
-                    for scope_span in resource_span.scope_spans {
-                        for span in scope_span.spans {
-                            spans.push((span, service_name.clone()));
-                        }
-                    }
-                }
+                all_resource_spans.extend(chunk.resource_spans);
             }
+
+            let spans = process_resource_spans(all_resource_spans);
 
             log::info!(
                 "get_archived_trace: Success - Found {} spans for archived trace '{}'",
@@ -964,21 +1014,17 @@ pub async fn get_archived_trace(
                 trace_id
             );
 
-            // Convert spans and collect processes
-            let mut jaeger_spans = Vec::new();
-            let mut processes = std::collections::HashMap::new();
-
-            for (span, service_name) in &spans {
-                let (jaeger_span, process_id, jaeger_process) =
-                    convert_span(span, service_name.clone());
-                jaeger_spans.push(jaeger_span);
-                processes.insert(process_id, jaeger_process);
-            }
-
-            let trace = JaegerTrace {
-                trace_id: trace_id.clone(),
-                spans: jaeger_spans,
-                processes,
+            let jaeger_traces = convert_to_jaeger_traces(spans);
+            let trace = if let Some(mut trace) = jaeger_traces.into_iter().next() {
+                // Use the original trace_id from the request to maintain consistency
+                trace.trace_id = trace_id.clone();
+                trace
+            } else {
+                JaegerTrace {
+                    trace_id: trace_id.clone(),
+                    spans: Vec::new(),
+                    processes: std::collections::HashMap::new(),
+                }
             };
             log::debug!(
                 "get_archived_trace: Created trace object with {} spans",
@@ -994,17 +1040,7 @@ pub async fn get_archived_trace(
                 trace_id,
                 e
             );
-
-            let response = ApiResponse {
-                data: vec![],
-                total: 0,
-                limit: 0,
-                offset: 0,
-                errors: Some(vec![ApiError {
-                    code: 404,
-                    msg: "Trace not found in archive".to_string(),
-                }]),
-            };
+            let response = ApiResponse::not_found("Trace not found in archive".to_string());
             log::debug!(
                 "get_archived_trace: Output - Error response: {:?}",
                 response.errors
