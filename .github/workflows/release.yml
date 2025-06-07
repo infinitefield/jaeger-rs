@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 permissions:
   contents: write
@@ -19,78 +19,78 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: jaeger-rs-${{ github.ref_name }}-macos-arm64.tar.gz
-    
+
     runs-on: ${{ matrix.os }}
-    
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Setup Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-        profile: minimal
-        override: true
-        target: ${{ matrix.target }}
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+          target: ${{ matrix.target }}
 
-    - name: Cache cargo registry
-      uses: actions/cache@v3
-      with:
-        path: ~/.cargo/registry
-        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
-    - name: Cache cargo index
-      uses: actions/cache@v3
-      with:
-        path: ~/.cargo/git
-        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+      - name: Cache cargo index
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
-    - name: Cache cargo build
-      uses: actions/cache@v3
-      with:
-        path: target
-        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+      - name: Cache cargo build
+        uses: actions/cache@v3
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
-    - name: Install system dependencies (Linux)
-      if: matrix.os == 'ubuntu-latest'
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y protobuf-compiler
+      - name: Install system dependencies (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
 
-    - name: Install system dependencies (macOS)
-      if: matrix.os == 'macos-latest'
-      run: brew install protobuf
+      - name: Install system dependencies (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install protobuf
 
-    - name: Build release binary
-      run: cargo build --release --target ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
 
-    - name: Create release archive
-      run: |
-        mkdir -p release
-        cp target/${{ matrix.target }}/release/jaeger-rs release/
-        tar -czf ${{ matrix.archive }} -C release .
+      - name: Create release archive
+        run: |
+          mkdir -p release
+          cp target/${{ matrix.target }}/release/jaeger-rs release/
+          tar -czf ${{ matrix.archive }} -C release .
 
-    - name: Upload build artifacts
-      uses: actions/upload-artifact@v3
-      with:
-        name: ${{ matrix.archive }}
-        path: ${{ matrix.archive }}
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
 
   create-release:
     needs: build-and-release
     runs-on: ubuntu-latest
-    
-    steps:
-    - name: Download all artifacts
-      uses: actions/download-artifact@v3
 
-    - name: Create GitHub Release
-      uses: softprops/action-gh-release@v1
-      with:
-        files: |
-          jaeger-rs-${{ github.ref_name }}-linux-x86_64.tar.gz/jaeger-rs-${{ github.ref_name }}-linux-x86_64.tar.gz
-          jaeger-rs-${{ github.ref_name }}-macos-arm64.tar.gz/jaeger-rs-${{ github.ref_name }}-macos-arm64.tar.gz
-        generate_release_notes: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            jaeger-rs-${{ github.ref_name }}-linux-x86_64.tar.gz/jaeger-rs-${{ github.ref_name }}-linux-x86_64.tar.gz
+            jaeger-rs-${{ github.ref_name }}-macos-arm64.tar.gz/jaeger-rs-${{ github.ref_name }}-macos-arm64.tar.gz
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
